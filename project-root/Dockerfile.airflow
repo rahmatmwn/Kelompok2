@@ -1,0 +1,24 @@
+FROM apache/airflow:2.8.1
+
+# Salin file requirements terlebih dahulu
+COPY requirements.txt /requirements.txt
+
+# Beralih ke root HANYA untuk instalasi paket sistem
+USER root
+
+# Instal dependensi sistem yang dibutuhkan untuk build, seperti psycopg2 dll.
+# Kita tidak akan menghapus build-essential agar pip bisa menggunakannya.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends wget build-essential && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# === KUNCI PERBAIKAN ===
+# Beralih kembali ke pengguna 'airflow' sebelum menjalankan perintah Python/pip.
+USER airflow
+
+# Sekarang, jalankan pip install sebagai pengguna 'airflow' yang benar.
+RUN pip install --no-cache-dir -r /requirements.txt
+
+# Buat direktori data dengan izin yang benar (sudah sebagai 'airflow')
+RUN mkdir -p /opt/airflow/data

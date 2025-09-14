@@ -1,0 +1,41 @@
+# --- Tahap Builder ---
+# Tahap ini digunakan untuk membangun paket Python, termasuk yang memerlukan kompilasi.
+FROM python:3.8-slim as builder
+
+WORKDIR /app
+
+# 1. Salin file requirements terlebih dahulu. Ini penting agar layer berikutnya
+#    dapat mengaksesnya.
+COPY api/requirements.txt .
+
+# 2. Jalankan instalasi dan pembersihan dalam SATU LANGKAH (satu layer).
+#    - apt-get update: Perbarui daftar paket.
+#    - apt-get install: Instal alat build (build-essential).
+#    - pip install: Instal semua paket Python dari requirements.txt.
+#    - apt-get purge: Hapus alat build yang sudah tidak diperlukan.
+#    - apt-get clean & rm: Hapus semua cache paket untuk menghemat ruang.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    pip install --no-cache-dir -r requirements.txt && \
+    apt-get purge -y --auto-remove build-essential && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- Tahap Final ---
+# Image final yang bersih dan kecil, hanya berisi aplikasi dan dependensinya.
+FROM python:3.8-slim
+
+WORKDIR /app
+
+# 3. Salin HANYA hasil yang diperlukan dari tahap builder:
+#    - Paket-paket Python yang sudah terinstal.
+#    - Executable Python seperti 'uvicorn' yang diinstal oleh pip.
+COPY --from=builder /usr/local/lib/python3.8/site-packages /usr/local/lib/python3.8/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# 4. Salin kode aplikasi Anda.
+COPY api/ .
+
+# 5. Expose port dan jalankan aplikasi.
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

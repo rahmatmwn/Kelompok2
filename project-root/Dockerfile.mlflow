@@ -1,0 +1,18 @@
+# Gunakan image resmi MLflow sebagai basis
+FROM ghcr.io/mlflow/mlflow:v2.10.0
+
+# Ganti ke user root untuk izin instalasi
+USER root
+
+# Instal, Gunakan, dan Bersihkan dependensi build dalam satu layer untuk menghemat ruang
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential python3-pip && \
+    
+    # Instal driver database
+    pip3 install --no-cache-dir psycopg2-binary && \
+    
+    # Hapus build-essential dan cache untuk memperkecil ukuran image final
+    apt-get purge -y --auto-remove build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# CATATAN: Baris "USER mlflow" dihapus untuk memperbaiki error

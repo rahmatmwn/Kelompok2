@@ -1,53 +1,43 @@
-# To learn more about how to use Nix to configure your environment
-# see: https://developers.google.com/idx/guides/customize-idx-env
 { pkgs, ... }: {
-  # Which nixpkgs channel to use.
-  channel = "stable-24.05"; # or "unstable"
-  # Use https://search.nixos.org/packages to find packages
+  channel = "stable-24.05";
+
+  # Mengaktifkan layanan Docker menggunakan sintaks yang benar untuk
+  # lingkungan Firebase Studio.
+  services.docker.enable = true;
+
   packages = [
-    # pkgs.go
-    # pkgs.python311
-    # pkgs.python311Packages.pip
-    # pkgs.nodejs_20
-    # pkgs.nodePackages.nodemon
+    pkgs.python311
+    pkgs.docker
+    pkgs.docker-compose
+    pkgs.wget
   ];
-  # Sets environment variables in the workspace
-  env = {};
+
   idx = {
-    # Search for the extensions you want on https://open-vsx.org/ and use "publisher.id"
     extensions = [
-      # "vscodevim.vim"
-      "google.gemini-cli-vscode-ide-companion"
+      "ms-python.python"
+      "ms-python.vscode-pylance"
+      "charliermarsh.ruff"
     ];
-    # Enable previews
+
     previews = {
       enable = true;
       previews = {
-        # web = {
-        #   # Example: run "npm run dev" with PORT set to IDX's defined port for previews,
-        #   # and show it in IDX's web preview panel
-        #   command = ["npm" "run" "dev"];
-        #   manager = "web";
-        #   env = {
-        #     # Environment variables to set for your server
-        #     PORT = "$PORT";
-        #   };
-        # };
-      };
-    };
-    # Workspace lifecycle hooks
-    workspace = {
-      # Runs when a workspace is first created
-      onCreate = {
-        # Example: install JS dependencies from NPM
-        # npm-install = "npm install";
-        # Open editors for the following files by default, if they exist:
-        default.openFiles = [ ".idx/dev.nix" "README.md" ];
-      };
-      # Runs when the workspace is (re)started
-      onStart = {
-        # Example: start a background task to watch and re-build backend code
-        # watch-backend = "npm run watch-backend";
+        airflow = {
+          command = ["sh" "-c" "echo \"Airflow akan tersedia di port 8080 setelah Anda menjalankan 'docker-compose up'. Buka tab 'Ports' untuk menemukan URL-nya.\" && sleep infinity"];
+          manager = "web";
+        };
+        api = {
+          command = ["sh" "-c" "echo \"API akan tersedia di port 8000 setelah Anda menjalankan 'docker-compose up'. Buka tab 'Ports' untuk menemukan URL-nya.\" && sleep infinity"];
+          manager = "web";
+        };
+        mlflow = {
+          command = ["sh" "-c" "echo \"MLflow akan tersedia di port 5000 setelah Anda menjalankan 'docker-compose up'. Buka tab 'Ports' untuk menemukan URL-nya.\" && sleep infinity"];
+          manager = "web";
+        };
+        metabase = {
+          command = ["sh" "-c" "echo \"Metabase akan tersedia di port 3000 setelah Anda menjalankan 'docker-compose up'. Buka tab 'Ports' untuk menemukan URL-nya.\" && sleep infinity"];
+          manager = "web";
+        };
       };
     };
   };

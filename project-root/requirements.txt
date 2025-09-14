@@ -1,0 +1,8 @@
+apache-airflow-providers-postgres
+pandas
+sqlalchemy
+psycopg2-binary
+scikit-learn
+mlflow
+Faker
+numpy
