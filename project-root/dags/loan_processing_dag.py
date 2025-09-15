@@ -15,6 +15,42 @@ DB_CONN_ID = "postgres_default"
 DATA_PATH = "/opt/airflow/data/loan_train.csv"
 
 
+# --- FUNGSI LOGIKA BISNIS ---
+def determine_loan_status(credit_history, income, coapplicant_income, loan_amount):
+    """
+    Menentukan status persetujuan pinjaman berdasarkan aturan bisnis sederhana.
+    Ini menggantikan logika acak sebelumnya untuk menghasilkan data yang lebih realistis.
+    """
+    # Gabungkan pendapatan
+    total_income = income + coapplicant_income
+
+    # Aturan #0: Handle kasus ekstrim/tidak valid
+    if total_income == 0 and loan_amount > 0:
+        return 'N' # Tidak mungkin dapat pinjaman tanpa pendapatan
+
+    # Aturan #1: Riwayat kredit buruk = 95% ditolak
+    if credit_history == 0.0:
+        return np.random.choice(['N', 'Y'], p=[0.95, 0.05])
+
+    # Hitung Debt-to-Income Ratio (DTI) bulanan yang sangat disederhanakan
+    # Asumsi tenor pinjaman rata-rata 360 bulan untuk kalkulasi kasar
+    monthly_payment = loan_amount / 360 
+    monthly_income = total_income / 12 if total_income > 0 else 1
+
+    dti = (monthly_payment / monthly_income) * 100 if monthly_income > 1 else 100
+
+    # Aturan #2: DTI sangat tinggi (> 60%) = 90% ditolak
+    if dti > 60:
+        return np.random.choice(['N', 'Y'], p=[0.90, 0.10])
+    
+    # Aturan #3: DTI tinggi (> 45%) = 50% ditolak
+    if dti > 45:
+        return np.random.choice(['N', 'Y'], p=[0.50, 0.50])
+
+    # Jika lolos semua aturan di atas, kemungkinan besar disetujui
+    return np.random.choice(['Y', 'N'], p=[0.92, 0.08])
+
+
 @dag(
     dag_id="loan_processing_dag",
     start_date=datetime(2023, 1, 1),
@@ -24,10 +60,10 @@ DATA_PATH = "/opt/airflow/data/loan_train.csv"
     doc_md="""
     ## Pipeline ELT untuk Data Persetujuan Pinjaman
     Pipeline ini melakukan proses ELT (Extract, Load, Transform) untuk data aplikasi pinjaman.
-    1. **Generate**: Membuat dataset CSV lokal dengan konteks Indonesia.
+    1. **Generate**: Membuat dataset CSV lokal dengan konteks Indonesia. **Logika status pinjaman diperbaiki.**
     2. **Load (Staging)**: Memuat data mentah ke dalam tabel staging di PostgreSQL.
     3. **Transform & Load (DWH)**: Membersihkan, mentransformasi, dan memuat data ke dalam
-       Data Warehouse dengan model Star Schema. **Logika DWH diperbaiki.**
+       Data Warehouse dengan model Star Schema.
     """,
     tags=["data-engineer", "loan-project", "final-fix"],
 )
@@ -41,6 +77,7 @@ def loan_processing_pipeline():
     def generate_local_dataset():
         """
         Membuat dataset CSV lokal dengan konteks Indonesia.
+        **Logika pembuatan `loan_status` sekarang menggunakan aturan bisnis.**
         """
         data_dir = os.path.dirname(DATA_PATH)
         if not os.path.exists(data_dir):
@@ -58,13 +95,17 @@ def loan_processing_pipeline():
             self_employed = np.random.choice(["No", "Yes"], p=[0.86, 0.14])
             applicant_income = int(np.random.gamma(2.5, 2000) * 1000)
             coapplicant_income = int(np.random.gamma(1.5, 1500) * 1000) if np.random.rand() > 0.4 else 0
-            loan_amount = int(np.random.gamma(3, 60_000) * 1000) # Diubah agar variasi puluhan-ratusan juta
+            loan_amount = int(np.random.gamma(3, 60_000) * 1000)
             loan_amount_term = np.random.choice(
-                [12.0, 24.0, 36.0, 60.0, 120.0, 180.0, 360.0] # Diubah menjadi lebih beragam (dalam bulan)
+                [12.0, 24.0, 36.0, 60.0, 120.0, 180.0, 360.0]
             )
             credit_history = np.random.choice([1.0, 0.0], p=[0.84, 0.16])
             property_area = np.random.choice(["Semiurban", "Urban", "Rural"], p=[0.38, 0.33, 0.29])
-            loan_status = np.random.choice(["Y", "N"], p=[0.69, 0.31])
+            
+            # --- PERUBAHAN KUNCI: Gunakan fungsi logika bisnis ---
+            loan_status = determine_loan_status(
+                credit_history, applicant_income, coapplicant_income, loan_amount
+            )
 
             # Simulasi data nulls
             row = {
@@ -115,11 +156,9 @@ def loan_processing_pipeline():
     def transform_and_load_dwh():
         """
         Membaca dari staging, melakukan transformasi Star Schema, dan memuat ke DWH.
-        PERBAIKAN: Menambahkan TRUNCATE untuk memastikan idempotensi.
         """
         engine = create_engine(POSTGRES_CONN_STRING)
 
-        # --- KUNCI PERBAIKAN: Kosongkan tabel DWH sebelum memuat data baru ---
         with engine.connect() as conn:
             conn.execute(
                 text(
@@ -128,7 +167,6 @@ def loan_processing_pipeline():
                 )
             )
         print("Successfully truncated DWH tables.")
-        # ------------------------------------------------------------------
 
         df_staging = pd.read_sql("SELECT * FROM stg_loan_applications", engine)
 
