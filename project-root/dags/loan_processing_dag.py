@@ -4,7 +4,6 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
-from faker import Faker
 
 from airflow.decorators import dag, task
 from airflow.providers.postgres.operators.postgres import PostgresOperator
@@ -15,111 +14,172 @@ DB_CONN_ID = "postgres_default"
 DATA_PATH = "/opt/airflow/data/loan_train.csv"
 
 
-# --- FUNGSI LOGIKA BISNIS ---
-def determine_loan_status(credit_history, income, coapplicant_income, loan_amount):
-    """
-    Menentukan status persetujuan pinjaman berdasarkan aturan bisnis sederhana.
-    Ini menggantikan logika acak sebelumnya untuk menghasilkan data yang lebih realistis.
-    """
-    # Gabungkan pendapatan
-    total_income = income + coapplicant_income
+# --- Helper finansial realistis (dari ChatGPT) ---
+def _annuity_payment(principal, annual_rate, n_months):
+    if n_months <= 0: return principal
+    r = max(annual_rate / 12.0, 1e-6)
+    return principal * r / (1 - (1 + r) ** -n_months)
 
-    # Aturan #0: Handle kasus ekstrim/tidak valid
-    if total_income == 0 and loan_amount > 0:
-        return 'N' # Tidak mungkin dapat pinjaman tanpa pendapatan
+def _principal_from_payment(monthly_payment, annual_rate, n_months):
+    if n_months <= 0: return 0
+    r = max(annual_rate / 12.0, 1e-6)
+    return monthly_payment * (1 - (1 + r) ** -n_months) / r
 
-    # Aturan #1: Riwayat kredit buruk = 95% ditolak
-    if credit_history == 0.0:
-        return np.random.choice(['N', 'Y'], p=[0.95, 0.05])
+def _sample_credit_history(education, self_employed, property_area):
+    p = 0.90 if education == "Graduate" else 0.78
+    if self_employed == "Yes": p -= 0.06
+    if property_area == "Rural": p -= 0.05
+    p = float(np.clip(p, 0.10, 0.95))
+    return 1.0 if np.random.rand() < p else 0.0
 
-    # Hitung Debt-to-Income Ratio (DTI) bulanan yang sangat disederhanakan
-    # Asumsi tenor pinjaman rata-rata 360 bulan untuk kalkulasi kasar
-    monthly_payment = loan_amount / 360 
-    monthly_income = total_income / 12 if total_income > 0 else 1
+def _sample_applicant_income(education, married, self_employed, property_area):
+    # income **BULANAN** (IDR)
+    if education == "Graduate":
+        shape, scale = 3.0, 3000   # mean ≈ 9 jt
+    else:
+        shape, scale = 2.2, 1800   # mean ≈ 4 jt
+    area_mul = {"Urban": 1.20, "Semiurban": 1.05, "Rural": 0.90}.get(property_area, 1.0)
+    married_mul = 1.06 if married == "Yes" else 1.0
+    se_mul = 0.95 if self_employed == "Yes" else 1.0
+    noise = np.random.normal(1.0, 0.05)
+    inc = np.random.gamma(shape, scale) * 1000 * area_mul * married_mul * se_mul * noise
+    return int(np.clip(inc, 2_000_000, 50_000_000))
 
-    dti = (monthly_payment / monthly_income) * 100 if monthly_income > 1 else 100
+def _sample_coapplicant_income(married, applicant_edu, property_area):
+    if married != "Yes" or np.random.rand() < 0.30:
+        return 0
+    if applicant_edu == "Graduate":
+        shape, scale = 2.2, 2200  # mean ~ 4.8 jt
+    else:
+        shape, scale = 2.0, 1600  # mean ~ 3.2 jt
+    area_mul = {"Urban": 1.15, "Semiurban": 1.03, "Rural": 0.90}.get(property_area, 1.0)
+    inc = np.random.gamma(shape, scale) * 1000 * area_mul
+    return int(np.clip(inc, 1_000_000, 30_000_000))
 
-    # Aturan #2: DTI sangat tinggi (> 60%) = 90% ditolak
-    if dti > 60:
-        return np.random.choice(['N', 'Y'], p=[0.90, 0.10])
+def _sample_term_and_loan(monthly_income_total, credit_history, property_area):
+    # bunga tahunan realistis
+    annual_rate = float(np.clip(np.random.normal(0.14, 0.03), 0.08, 0.20))
+    # target PTI (cicilan/bulan / income/bulan)
+    pti = float(np.clip(np.random.normal(0.32, 0.07), 0.15, 0.50))
+    if credit_history == 0.0: pti = min(pti, 0.28)
+    if property_area == "Urban": pti = min(pti + 0.02, 0.50)
+
+    # tenor dipilih dulu, lalu plafon dihitung dari cicilan target via anuitas
+    if monthly_income_total < 6_000_000:
+        choices, probs = [12.0, 24.0, 36.0, 60.0], [0.20, 0.30, 0.35, 0.15]
+    elif monthly_income_total < 12_000_000:
+        choices, probs = [24.0, 36.0, 60.0, 120.0], [0.10, 0.35, 0.35, 0.20]
+    else:
+        choices, probs = [36.0, 60.0, 120.0, 180.0, 240.0, 360.0], [0.05,0.20,0.35,0.20,0.10,0.10]
+    term = float(np.random.choice(choices, p=probs))
+
+    monthly_pay_target = pti * monthly_income_total
+    principal = _principal_from_payment(monthly_pay_target, annual_rate, int(term))
+    loan_amount = int(np.clip(principal * np.random.uniform(0.9, 1.1), 5_000_000, 2_000_000_000))
+    return loan_amount, term, annual_rate, pti
+
+def determine_loan_status_realistic(education, married, dependents, self_employed,
+                                    property_area, credit_history,
+                                    applicant_income, coapplicant_income,
+                                    loan_amount, loan_amount_term, annual_rate):
+    # Keputusan probabilistik berbasis PTI + faktor risiko.
+    total_inc_mo = applicant_income + coapplicant_income
+    if total_inc_mo <= 0: 
+        return 'N'
     
-    # Aturan #3: DTI tinggi (> 45%) = 50% ditolak
-    if dti > 45:
-        return np.random.choice(['N', 'Y'], p=[0.50, 0.50])
+    # handle potential zero term
+    if loan_amount_term is None or loan_amount_term == 0:
+        return 'N'
 
-    # Jika lolos semua aturan di atas, kemungkinan besar disetujui
-    return np.random.choice(['Y', 'N'], p=[0.92, 0.08])
+    pay_mo = _annuity_payment(loan_amount, annual_rate, int(loan_amount_term))
+    pti = pay_mo / total_inc_mo
 
+    # skor logit sederhana
+    z = -0.15
+    z += 1.6 if credit_history == 1.0 else -1.0
+    z += 0.30 if education == "Graduate" else 0.0
+    z += 0.15 if married == "Yes" else 0.0
+    z -= 0.25 if self_employed == "Yes" else 0.0
+    z += 0.12 if property_area == "Urban" else (0.04 if property_area == "Semiurban" else 0.0)
+
+    # penalti dependents
+    dep = str(dependents)
+    z -= (0.25 if dep in {"2","3+"} else (0.10 if dep=="1" else 0.0))
+
+    # penalti/bonus dari PTI
+    if pti <= 0.35: z += 0.8
+    elif pti <= 0.45: z += 0.2
+    elif pti <= 0.55: z -= 0.4
+    else: z -= 0.9
+
+    # noise kecil
+    z += np.random.normal(0, 0.25)
+
+    p = 1/(1+np.exp(-z))
+    return 'Y' if np.random.rand() < p else 'N'
 
 @dag(
     dag_id="loan_processing_dag",
     start_date=datetime(2023, 1, 1),
-    schedule_interval="@daily",
+    schedule_interval=None,
     catchup=False,
     template_searchpath="/opt/airflow/sql",
-    doc_md="""
-    ## Pipeline ELT untuk Data Persetujuan Pinjaman
-    Pipeline ini melakukan proses ELT (Extract, Load, Transform) untuk data aplikasi pinjaman.
-    1. **Generate**: Membuat dataset CSV lokal dengan konteks Indonesia. **Logika status pinjaman diperbaiki.**
+    doc_md='''
+    ## Pipeline ELT untuk Data Persetujuan Pinjaman (Logika Realistis)
+    Pipeline ini menggunakan logika yang disempurnakan untuk menghasilkan data yang lebih realistis.
+    1. **Generate**: Membuat 100.000 baris data CSV dengan korelasi fitur yang kaya.
     2. **Load (Staging)**: Memuat data mentah ke dalam tabel staging di PostgreSQL.
-    3. **Transform & Load (DWH)**: Membersihkan, mentransformasi, dan memuat data ke dalam
-       Data Warehouse dengan model Star Schema.
-    """,
-    tags=["data-engineer", "loan-project", "final-fix"],
+    3. **Transform & Load (DWH)**: Membersihkan dan memuat data ke dalam Data Warehouse.
+    ''',
+    tags=["data-engineer", "loan-project"],
 )
 def loan_processing_pipeline():
-    """
-    ### Pipeline ELT Data Pinjaman
-    DAG ini mengorkestrasi seluruh proses dari pembuatan data hingga memuatnya ke DWH.
-    """
-
     @task
     def generate_local_dataset():
-        """
-        Membuat dataset CSV lokal dengan konteks Indonesia.
-        **Logika pembuatan `loan_status` sekarang menggunakan aturan bisnis.**
-        """
         data_dir = os.path.dirname(DATA_PATH)
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
 
-        fake = Faker("id_ID")
-        num_records = 614  # Sesuai jumlah data asli
-
+        num_records = 100000
         data = []
+
         for i in range(num_records):
-            gender = np.random.choice(["Male", "Female"], p=[0.81, 0.19])
+            education = np.random.choice(["Graduate", "Not Graduate"], p=[0.70, 0.30])
             married = np.random.choice(["Yes", "No"], p=[0.65, 0.35])
-            dependents = np.random.choice(["0", "1", "2", "3+"], p=[0.57, 0.17, 0.17, 0.09])
-            education = np.random.choice(["Graduate", "Not Graduate"], p=[0.78, 0.22])
+            gender = np.random.choice(["Male", "Female"], p=[0.81, 0.19])
             self_employed = np.random.choice(["No", "Yes"], p=[0.86, 0.14])
-            applicant_income = int(np.random.gamma(2.5, 2000) * 1000)
-            coapplicant_income = int(np.random.gamma(1.5, 1500) * 1000) if np.random.rand() > 0.4 else 0
-            loan_amount = int(np.random.gamma(3, 60_000) * 1000)
-            loan_amount_term = np.random.choice(
-                [12.0, 24.0, 36.0, 60.0, 120.0, 180.0, 360.0]
-            )
-            credit_history = np.random.choice([1.0, 0.0], p=[0.84, 0.16])
             property_area = np.random.choice(["Semiurban", "Urban", "Rural"], p=[0.38, 0.33, 0.29])
-            
-            # --- PERUBAHAN KUNCI: Gunakan fungsi logika bisnis ---
-            loan_status = determine_loan_status(
-                credit_history, applicant_income, coapplicant_income, loan_amount
+
+            dependents = (np.random.choice(["0","1","2","3+"], p=[0.35,0.30,0.22,0.13])
+                          if married=="Yes" else "0")
+
+            applicant_income = _sample_applicant_income(education, married, self_employed, property_area)
+            coapplicant_income = _sample_coapplicant_income(married, education, property_area)
+
+            credit_history = _sample_credit_history(education, self_employed, property_area)
+
+            total_income_mo = applicant_income + coapplicant_income
+            loan_amount, loan_amount_term, annual_rate, pti_target = _sample_term_and_loan(
+                total_income_mo, credit_history, property_area
             )
 
-            # Simulasi data nulls
+            loan_status = determine_loan_status_realistic(
+                education, married, dependents, self_employed, property_area, credit_history,
+                applicant_income, coapplicant_income, loan_amount, loan_amount_term, annual_rate
+            )
+
             row = {
                 "Loan_ID": f"LP00{1000+i}",
                 "Gender": np.random.choice([gender, None], p=[0.98, 0.02]),
                 "Married": np.random.choice([married, None], p=[0.99, 0.01]),
                 "Dependents": np.random.choice([dependents, None], p=[0.97, 0.03]),
-                "Self_Employed": np.random.choice([self_employed, None], p=[0.95, 0.05]),
-                "LoanAmount": np.random.choice([loan_amount, None], p=[0.96, 0.04]),
-                "Loan_Amount_Term": np.random.choice([loan_amount_term, None], p=[0.98, 0.02]),
-                "Credit_History": np.random.choice([credit_history, None], p=[0.92, 0.08]),
                 "Education": education,
-                "ApplicantIncome": applicant_income,
-                "CoapplicantIncome": coapplicant_income,
+                "Self_Employed": np.random.choice([self_employed, None], p=[0.95, 0.05]),
+                "ApplicantIncome": applicant_income, # BULANAN
+                "CoapplicantIncome": coapplicant_income, # BULANAN
+                "LoanAmount": np.random.choice([loan_amount, None], p=[0.97, 0.03]),
+                "Loan_Amount_Term": np.random.choice([loan_amount_term, None], p=[0.99, 0.01]),
+                "Credit_History": np.random.choice([credit_history, None], p=[0.95, 0.05]),
                 "Property_Area": property_area,
                 "Loan_Status": loan_status,
             }
@@ -137,9 +197,6 @@ def loan_processing_pipeline():
 
     @task
     def load_to_staging():
-        """
-        Memuat file CSV ke tabel staging.
-        """
         df = pd.read_csv(DATA_PATH)
         df.columns = [c.lower().replace(" ", "_") for c in df.columns]
         engine = create_engine(POSTGRES_CONN_STRING)
@@ -154,23 +211,15 @@ def loan_processing_pipeline():
 
     @task
     def transform_and_load_dwh():
-        """
-        Membaca dari staging, melakukan transformasi Star Schema, dan memuat ke DWH.
-        """
         engine = create_engine(POSTGRES_CONN_STRING)
-
         with engine.connect() as conn:
             conn.execute(
-                text(
-                    "TRUNCATE TABLE dim_customers, dim_location, dim_loan_details, fact_loans "
-                    "RESTART IDENTITY CASCADE"
-                )
+                text("TRUNCATE TABLE dim_customers, dim_location, dim_loan_details, fact_loans RESTART IDENTITY CASCADE")
             )
         print("Successfully truncated DWH tables.")
 
         df_staging = pd.read_sql("SELECT * FROM stg_loan_applications", engine)
 
-        # 1. Cleaning & Persiapan
         df_staging["loan_status_approved"] = df_staging["loan_status"] == "Y"
         df_staging["dependents"] = df_staging["dependents"].fillna("0")
         df_staging["self_employed"] = df_staging["self_employed"].fillna("No")
@@ -179,64 +228,33 @@ def loan_processing_pipeline():
         for col in ["loanamount", "loan_amount_term", "credit_history"]:
             df_staging[col].fillna(df_staging[col].median(), inplace=True)
 
-        # 2. Dimensi
-        dim_customers = df_staging[
-            ["gender", "married", "dependents", "education", "self_employed", "credit_history"]
-        ].drop_duplicates().reset_index(drop=True)
+        dim_customers = df_staging[["gender", "married", "dependents", "education", "self_employed", "credit_history"]].drop_duplicates().reset_index(drop=True)
         dim_customers["customer_id"] = dim_customers.index
         dim_customers.to_sql("dim_customers", engine, if_exists="append", index=False)
 
-        dim_location = df_staging[["property_area"]].drop_duplicates().reset_index(drop=True)
+        dim_location = df_staging[['property_area']].drop_duplicates().reset_index(drop=True)
         dim_location["location_id"] = dim_location.index
         dim_location.to_sql("dim_location", engine, if_exists="append", index=False)
 
-        dim_loan_details = df_staging[["loan_id"]].drop_duplicates().reset_index(drop=True)
+        dim_loan_details = df_staging[['loan_id']].drop_duplicates().reset_index(drop=True)
         dim_loan_details["loan_detail_id"] = dim_loan_details.index
         dim_loan_details.to_sql("dim_loan_details", engine, if_exists="append", index=False)
 
-        print(
-            f"Loaded {len(dim_customers)} customers, {len(dim_location)} locations, "
-            f"{len(dim_loan_details)} loan details."
-        )
+        print(f"Loaded {len(dim_customers)} customers, {len(dim_location)} locations, {len(dim_loan_details)} loan details.")
 
-        # 3. Merge ke tabel fakta
-        df_merged = df_staging.merge(
-            dim_customers,
-            on=["gender", "married", "dependents", "education", "self_employed", "credit_history"],
-        )
+        df_merged = df_staging.merge(dim_customers, on=["gender", "married", "dependents", "education", "self_employed", "credit_history"])
         df_merged = df_merged.merge(dim_location, on="property_area")
         df_merged = df_merged.merge(dim_loan_details, on="loan_id")
 
-        fact_loans = df_merged[
-            [
-                "customer_id",
-                "location_id",
-                "loan_detail_id",
-                "applicantincome",
-                "coapplicantincome",
-                "loanamount",
-                "loan_amount_term",
-                "loan_status_approved",
-            ]
-        ].rename(
-            columns={
-                "applicantincome": "applicant_income",
-                "coapplicantincome": "coapplicant_income",
-                "loanamount": "loan_amount",
-            }
-        )
-
-        # 4. Load fakta
+        fact_loans = df_merged[['customer_id', 'location_id', 'loan_detail_id', 'applicantincome', 'coapplicantincome', 'loanamount', 'loan_amount_term', 'loan_status_approved']].rename(columns={"applicantincome": "applicant_income", "coapplicantincome": "coapplicant_income", "loanamount": "loan_amount"})
         fact_loans.to_sql("fact_loans", engine, if_exists="append", index=False)
         print(f"Successfully loaded {len(fact_loans)} records into fact_loans table.")
 
-    # Alur tugas
     generate_dataset_task = generate_local_dataset()
     load_staging_task = load_to_staging()
     transform_dwh_task = transform_and_load_dwh()
 
     generate_dataset_task >> create_staging_table >> load_staging_task
     load_staging_task >> create_dwh_tables >> transform_dwh_task
-
 
 loan_processing_dag = loan_processing_pipeline()
