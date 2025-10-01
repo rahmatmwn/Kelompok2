@@ -116,7 +116,7 @@ cd project-root
 Perintah ini akan membuat *image* untuk setiap layanan dan menjalankannya di *background*.
 
 ```bash
-docker-compose up -d --build
+docker-compose up -d 
 ```
 > **Tunggu beberapa menit** agar semua layanan (khususnya Airflow dan PostgreSQL) sepenuhnya siap. Anda dapat memeriksa status dengan `docker-compose ps`.
 
@@ -149,6 +149,12 @@ Layanan API memuat model "Production" saat container dibangun. Karena kita baru 
 
 ```bash
 docker-compose up -d --build api
+```
+
+#Kalau model tidak terupdate jalankan
+
+```bash
+docker-compose up -d --force-recreate --build api
 ```
 > Perintah ini secara spesifik akan membangun ulang image untuk layanan `api` dan memastikannya menggunakan kode dan model terbaru.
 

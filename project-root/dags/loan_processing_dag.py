@@ -194,7 +194,7 @@ def determine_loan_status_realistic(
 @dag(
     dag_id="loan_processing_dag",
     start_date=datetime(2023, 1, 1),
-    schedule_interval=None,  # manual trigger by default
+    schedule_interval="0 2 * * *",  # Runs once a day at 2 AM
     catchup=False,
     template_searchpath="/opt/airflow/sql",
     doc_md='''
@@ -204,7 +204,7 @@ def determine_loan_status_realistic(
     2. **Load (Staging)**: Memuat data mentah ke dalam tabel staging di PostgreSQL.
     3. **Transform & Load (DWH)**: Membersihkan dan memuat data ke dalam Data Warehouse (Star Schema).
     ''',
-    tags=["data-engineer", "loan-project", "realistic-synth"],
+    tags=["data-engineer", "loan-project"],
 )
 def loan_processing_pipeline():
     @task
